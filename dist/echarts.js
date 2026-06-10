@@ -33267,6 +33267,88 @@
       return mathPow$1(base, linearTickVal);
     }
     /**
+     * Forward transform for `'asinh'` log mapping: `a0 * asinh(val / a0)`.
+     * Handles zero and negative values, unlike `logScaleLogTick`.
+     * Linear near zero (`|val| << a0`), logarithmic away from zero (`|val| >> a0`).
+     *
+     * NOTE:
+     *  - If `val` is `0`, returns `0` exactly.
+     *  - If `val` is negative, returns a negative result (odd-symmetric).
+     *  - `a0` must be strictly positive.
+     *
+     * @see {asinhScaleInverseTick}
+     */
+    function asinhScaleForwardTick(val, a0) {
+      return Math.asinh(val / a0) * a0;
+    }
+    /**
+     * Inverse transform for `'asinh'` log mapping: `a0 * sinh(linearVal / a0)`.
+     * Converts a value from asinh-transformed space back to raw data space.
+     *
+     * The lookup table serves the same role as in `logScalePowTick`: floating-point
+     * drift means `sinh(asinh(x))` may not round-trip exactly to `x` for extent
+     * endpoints, which would cause tick labels like `99.99999999999999`. Lookups
+     * at known extent boundaries bypass the math and return the original raw value.
+     *
+     * [CAUTION]:
+     *  Monotonicity may be broken on extent ends - callers must make sure it does not matter.
+     *
+     * @see {asinhScaleForwardTick}
+     */
+    function asinhScaleInverseTick(linearVal, a0, opt) {
+      // Short-circuit at known extent boundaries to avoid floating-point drift.
+      // The lookup table is the same pattern used in logScalePowTick.
+      var lookup = opt && opt.lookup;
+      if (lookup) {
+        for (var i = 0; i < lookup.from.length; i++) {
+          if (linearVal === lookup.from[i]) {
+            return lookup.to[i];
+          }
+        }
+      }
+      return Math.sinh(linearVal / a0) * a0;
+    }
+    /**
+     * Forward transform for `'symlog'` log mapping: `sign(val) * ln(1 + |val| / C)`.
+     * Handles zero and negative values, unlike `logScaleLogTick`.
+     * Linear near zero (`|val| << C`), logarithmic away from zero (`|val| >> C`).
+     *
+     * NOTE:
+     *  - If `val` is `0`, returns `0` exactly.
+     *  - If `val` is negative, returns a negative result (odd-symmetric).
+     *  - `C` must be strictly positive.
+     *
+     * @see {symlogScaleInverseTick}
+     */
+    function symlogScaleForwardTick(val, C) {
+      return Math.sign(val) * Math.log1p(Math.abs(val) / C);
+    }
+    /**
+     * Inverse transform for `'symlog'` log mapping: `sign(linearVal) * (e^|linearVal| - 1) * C`.
+     * Converts a value from symlog-transformed space back to raw data space.
+     *
+     * The lookup table serves the same role as in `logScalePowTick`: floating-point
+     * drift means `expm1(log1p(x))` may not round-trip exactly to `x` for extent
+     * endpoints. Lookups at known extent boundaries bypass the math and return the
+     * original raw value.
+     *
+     * [CAUTION]:
+     *  Monotonicity may be broken on extent ends - callers must make sure it does not matter.
+     *
+     * @see {symlogScaleForwardTick}
+     */
+    function symlogScaleInverseTick(linearVal, C, opt) {
+      var lookup = opt && opt.lookup;
+      if (lookup) {
+        for (var i = 0; i < lookup.from.length; i++) {
+          if (linearVal === lookup.from[i]) {
+            return lookup.to[i];
+          }
+        }
+      }
+      return Math.sign(linearVal) * Math.expm1(Math.abs(linearVal)) * C;
+    }
+    /**
      * For `IntervalScale`, convert `rawExtent` to:
      *  - Be no non-finite number.
      *  - Be `extent[0] < extent[1]`- no equal; otherwise, additional handling is required
@@ -34296,6 +34378,15 @@
         _this.type = 'log';
         _this.parse = IntervalScale.parse;
         _this.base = setting.logBase || 10;
+        _this.logMapping = setting.logMapping === 'asinh' || setting.logMapping === 'symlog' ? setting.logMapping : undefined;
+        var rawLw = setting.logLinearWidth || 1;
+        if (_this.logMapping && (rawLw <= 0 || !isFinite(rawLw))) {
+          if ("development" !== 'production') {
+            warn('logLinearWidth must be a finite positive number. Falling back to 1.');
+          }
+        }
+        _this.linearWidth = _this.logMapping && (rawLw <= 0 || !isFinite(rawLw)) ? 1 : rawLw;
+        _this._mappedLogTicks = null;
         var lookupFrom = [];
         var lookupTo = [];
         var lookup = _this._lookup = {
@@ -34303,15 +34394,24 @@
           to: lookupTo
         };
         lookupFrom[LOOKUP_IDX_EXTENT_START] = lookupFrom[LOOKUP_IDX_EXTENT_END] = lookupTo[LOOKUP_IDX_EXTENT_START] = lookupTo[LOOKUP_IDX_EXTENT_END] = NaN;
-        decorateScaleMapper(_this, LogScale.mapperMethods);
+        var mapperMethods = LogScale.mapperMethods;
+        if (_this.logMapping === 'asinh') {
+          mapperMethods = LogScale.asinhMapperMethods;
+        } else if (_this.logMapping === 'symlog') {
+          mapperMethods = LogScale.symlogMapperMethods;
+        }
+        decorateScaleMapper(_this, mapperMethods);
         var scaleBreakHelper = getScaleBreakHelper();
         var breakOption = setting.breakOption;
         var out = {
           lookup: lookup
         };
         if (scaleBreakHelper) {
-          scaleBreakHelper.parseAxisBreakOptionInwardTransform(breakOption, _this, {
-            noNegative: true
+          // TODO: axis breaks are not yet supported for mapped-log mode (asinh/symlog).
+          // The interaction between transformed break boundaries and the dual-stub
+          // architecture has not been analysed. Revisit in a follow-up PR.
+          scaleBreakHelper.parseAxisBreakOptionInwardTransform(_this.logMapping ? undefined : breakOption, _this, {
+            noNegative: !_this.logMapping
           }, LOOKUP_IDX_BREAK_START, out);
         }
         _this.powStub = new IntervalScale({
@@ -34324,6 +34424,13 @@
         return _this;
       }
       LogScale.prototype.getTicks = function (opt) {
+        // Mapped-log ticks are pre-computed by logMappingCalcNiceTicks in
+        // axisNiceTicks.ts, because they are non-uniformly spaced in transformed
+        // space and cannot be generated by intervalStub.getTicks() (which assumes
+        // uniform spacing). _mappedLogTicks is set before getTicks is ever called.
+        if (this._mappedLogTicks) {
+          return this._mappedLogTicks;
+        }
         var base = this.base;
         var powStub = this.powStub;
         var scaleBreakHelper = getScaleBreakHelper();
@@ -34431,6 +34538,126 @@
           return depth === null ? this.powStub.getExtentUnsafe(kind, null) : this.intervalStub.getExtentUnsafe(kind, depth);
         }
       };
+      LogScale.asinhMapperMethods = {
+        needTransform: function () {
+          return true;
+        },
+        normalize: function (val) {
+          return this.intervalStub.normalize(asinhScaleForwardTick(val, this.linearWidth || 1));
+        },
+        scale: function (val) {
+          return asinhScaleInverseTick(this.intervalStub.scale(val), this.linearWidth || 1, null);
+        },
+        transformIn: function (val, opt) {
+          val = asinhScaleForwardTick(val, this.linearWidth || 1);
+          return opt && opt.depth === SCALE_MAPPER_DEPTH_OUT_OF_BREAK ? val : this.intervalStub.transformIn(val, opt);
+        },
+        transformOut: function (val, opt) {
+          var depth = opt ? opt.depth : null;
+          tmpTransformOutOpt1.depth = depth;
+          tmpTransformOutOpt2.lookup = this._lookup;
+          return asinhScaleInverseTick(depth === SCALE_MAPPER_DEPTH_OUT_OF_BREAK ? val : this.intervalStub.transformOut(val, tmpTransformOutOpt1), this.linearWidth || 1, tmpTransformOutOpt2);
+        },
+        contain: function (val) {
+          return this.powStub.contain(val);
+        },
+        setExtent: function (start, end) {
+          this.setExtent2(SCALE_EXTENT_KIND_EFFECTIVE, start, end);
+        },
+        setExtent2: function (kind, start, end) {
+          if (!isValidBoundsForExtent(start, end)) {
+            return;
+          }
+          // No sign guard — asinh is defined for all real numbers.
+          var lw = this.linearWidth || 1;
+          var lookupTo = tmpNotUsedArr;
+          var lookupFrom = tmpNotUsedArr;
+          if (kind === SCALE_EXTENT_KIND_EFFECTIVE) {
+            var lookup = this._lookup;
+            lookupTo = lookup.to;
+            lookupFrom = lookup.from;
+          }
+          this.powStub.setExtent2(kind, lookupTo[LOOKUP_IDX_EXTENT_START] = start, lookupTo[LOOKUP_IDX_EXTENT_END] = end);
+          this.intervalStub.setExtent2(kind, lookupFrom[LOOKUP_IDX_EXTENT_START] = asinhScaleForwardTick(start, lw), lookupFrom[LOOKUP_IDX_EXTENT_END] = asinhScaleForwardTick(end, lw));
+        },
+        getFilter: function () {
+          // No positivity guard — accept all real numbers.
+          return {};
+        },
+        sanitize: function (value) {
+          // No clamping — asinh accepts all real values including zero and negatives.
+          return value;
+        },
+        getDefaultStartValue: function () {
+          return 0;
+        },
+        getExtent: function () {
+          return this.powStub.getExtent();
+        },
+        getExtentUnsafe: function (kind, depth) {
+          return depth === null ? this.powStub.getExtentUnsafe(kind, null) : this.intervalStub.getExtentUnsafe(kind, depth);
+        }
+      };
+      LogScale.symlogMapperMethods = {
+        needTransform: function () {
+          return true;
+        },
+        normalize: function (val) {
+          return this.intervalStub.normalize(symlogScaleForwardTick(val, this.linearWidth || 1));
+        },
+        scale: function (val) {
+          return symlogScaleInverseTick(this.intervalStub.scale(val), this.linearWidth || 1, null);
+        },
+        transformIn: function (val, opt) {
+          val = symlogScaleForwardTick(val, this.linearWidth || 1);
+          return opt && opt.depth === SCALE_MAPPER_DEPTH_OUT_OF_BREAK ? val : this.intervalStub.transformIn(val, opt);
+        },
+        transformOut: function (val, opt) {
+          var depth = opt ? opt.depth : null;
+          tmpTransformOutOpt1.depth = depth;
+          tmpTransformOutOpt2.lookup = this._lookup;
+          return symlogScaleInverseTick(depth === SCALE_MAPPER_DEPTH_OUT_OF_BREAK ? val : this.intervalStub.transformOut(val, tmpTransformOutOpt1), this.linearWidth || 1, tmpTransformOutOpt2);
+        },
+        contain: function (val) {
+          return this.powStub.contain(val);
+        },
+        setExtent: function (start, end) {
+          this.setExtent2(SCALE_EXTENT_KIND_EFFECTIVE, start, end);
+        },
+        setExtent2: function (kind, start, end) {
+          if (!isValidBoundsForExtent(start, end)) {
+            return;
+          }
+          // No sign guard — symlog is defined for all real numbers.
+          var lw = this.linearWidth || 1;
+          var lookupTo = tmpNotUsedArr;
+          var lookupFrom = tmpNotUsedArr;
+          if (kind === SCALE_EXTENT_KIND_EFFECTIVE) {
+            var lookup = this._lookup;
+            lookupTo = lookup.to;
+            lookupFrom = lookup.from;
+          }
+          this.powStub.setExtent2(kind, lookupTo[LOOKUP_IDX_EXTENT_START] = start, lookupTo[LOOKUP_IDX_EXTENT_END] = end);
+          this.intervalStub.setExtent2(kind, lookupFrom[LOOKUP_IDX_EXTENT_START] = symlogScaleForwardTick(start, lw), lookupFrom[LOOKUP_IDX_EXTENT_END] = symlogScaleForwardTick(end, lw));
+        },
+        getFilter: function () {
+          // No positivity guard — accept all real numbers.
+          return {};
+        },
+        sanitize: function (value) {
+          // No clamping — symlog accepts all real values including zero and negatives.
+          return value;
+        },
+        getDefaultStartValue: function () {
+          return 0;
+        },
+        getExtent: function () {
+          return this.powStub.getExtent();
+        },
+        getExtentUnsafe: function (kind, depth) {
+          return depth === null ? this.powStub.getExtentUnsafe(kind, null) : this.intervalStub.getExtentUnsafe(kind, depth);
+        }
+      };
       return LogScale;
     }(Scale);
     Scale.registerClass(LogScale);
@@ -34523,6 +34750,8 @@
           // See also #3749
           return new LogScale({
             logBase: model.get('logBase'),
+            logMapping: model.get('logMapping'),
+            logLinearWidth: model.get('logLinearWidth'),
             breakOption: breakOption
           });
         case 'value':
@@ -35577,6 +35806,11 @@
       // [CAVEAT]: If updating this impl, need to sync it to `axisAlignTicks.ts`.
       var isTargetLogScale = isLogScale(scale);
       var intervalStub = isTargetLogScale ? scale.intervalStub : scale;
+      // For mapped-log axes (asinh/symlog), use the raw-space tick strategy.
+      if (isTargetLogScale && scale.logMapping) {
+        logMappingCalcNiceTicks(scale, opt.splitNumber);
+        return;
+      }
       var fixMinMax = opt.fixMinMax || [];
       var oldOutermostExtent = isTargetLogScale ? scale.getExtent() : null;
       var oldIntervalExtent = intervalStub.getExtent();
@@ -35671,6 +35905,90 @@
         interval: interval,
         niceExtent: niceExtent
       };
+    }
+    // ------ END: LogScale Nice ------
+    // ------ START: logMapping Nice ------
+    /**
+     * Tick strategy for `logMapping: 'asinh' | 'symlog'` axes.
+     *
+     * Standard log ticking assumes integer intervals in transformed space (integer
+     * log_b values = powers of b in raw space). For asinh/symlog the candidates
+     * `0, ±a0, ±b*a0, ...` are non-uniformly spaced in transformed space, so a
+     * single integer interval does not work.
+     *
+     * Strategy: choose candidates in raw-value space, store as `_mappedLogTicks`,
+     * then set `intervalStub` extent to the transformed range so that
+     * `normalize`/`scale` pixel mapping remains correct.
+     */
+    function logMappingCalcNiceTicks(scale, splitNumber) {
+      var base = scale.base;
+      var a0 = scale.linearWidth || 1;
+      var _a = scale.getExtent(),
+        rawMin = _a[0],
+        rawMax = _a[1];
+      var maxTicks = ensureValidSplitNumber(splitNumber, 5) + 1;
+      var forward = scale.logMapping === 'asinh' ? function (v) {
+        return asinhScaleForwardTick(v, a0);
+      } : function (v) {
+        return symlogScaleForwardTick(v, a0);
+      };
+      // Count how many powers of `base` span the extent so we can decide
+      // whether to step by base^1, base^2, … to stay within `splitNumber`.
+      var absMax = Math.max(Math.abs(rawMin), Math.abs(rawMax));
+      var totalSteps = absMax > a0 ? Math.ceil(Math.log(absMax / a0) / Math.log(base)) : 0;
+      // Account for both positive and negative sides plus zero.
+      var hasNeg = rawMin < 0;
+      var hasPos = rawMax > 0;
+      var sidesMultiplier = hasNeg && hasPos ? 2 : 1;
+      var estimatedTicks = totalSteps * sidesMultiplier + 1; // +1 for zero
+      // Raise the effective base so tick count stays within splitNumber.
+      var stride = 1;
+      if (estimatedTicks > maxTicks && totalSteps > 0) {
+        stride = Math.ceil(totalSteps * sidesMultiplier / (maxTicks - 1));
+      }
+      var effectiveBase = Math.pow(base, stride);
+      // Candidates: 0, ±a0, ±a0·effectiveBase, ±a0·effectiveBase², ...
+      var candidates = [0];
+      var v = a0;
+      while (v <= absMax * 1.0001) {
+        candidates.push(v, -v);
+        v *= effectiveBase;
+      }
+      // Filter to data extent and sort ascending.
+      // Candidates are distinct by construction (0 once, then ±v pairs with v > 0),
+      // so no deduplication is needed.
+      var filtered = [];
+      candidates.sort(function (a, b) {
+        return a - b;
+      });
+      for (var i = 0; i < candidates.length; i++) {
+        var c = candidates[i];
+        if (c >= rawMin && c <= rawMax) {
+          filtered.push(c);
+        }
+      }
+      var ticks = map(filtered, function (value) {
+        return {
+          value: value
+        };
+      });
+      // Degenerate extent: ensure at least one tick.
+      if (ticks.length === 0) {
+        ticks.push({
+          value: (rawMin + rawMax) / 2
+        });
+      }
+      scale._mappedLogTicks = ticks;
+      // Align intervalStub extent to the transformed min/max of the chosen ticks
+      // so that `normalize`/`scale` (pixel mapping) work correctly.
+      // Set a dummy interval on the stub. This is required to configure the
+      // underlying IntervalScale, but the interval value itself is never used
+      // because getTicks() is bypassed for mapped-log axes.
+      var intervalStub = scale.intervalStub;
+      intervalStub.setExtent(forward(ticks[0].value), forward(ticks[ticks.length - 1].value));
+      intervalStub.setConfig({
+        interval: 1
+      });
     }
     /**
      * NOTE: See the summary of the process of extent determination in the comment of `scaleMapper.setExtent`.
@@ -48652,7 +48970,9 @@
       }
     }, valueAxis);
     var logAxis = defaults({
-      logBase: 10
+      logBase: 10,
+      logMapping: 'none',
+      logLinearWidth: 1
     }, valueAxis);
     var axisDefault = {
       category: categoryAxis,
@@ -48906,6 +49226,13 @@
       //  (1) Axis inverse is not considered yet.
       //  (2) `SCALE_EXTENT_KIND_MAPPING` is not considered yet.
       var isTargetLogScale = isLogScale(targetScale);
+      // alignTicks is not supported for mapped log scales (asinh/symlog).
+      // loopIncreaseInterval multiplies by targetLogScaleBase, which assumes
+      // integer spacing in log space. That assumption does not hold for these
+      // transforms, so each axis calculates its own nice ticks independently.
+      if (isTargetLogScale && targetScale.logMapping) {
+        return;
+      }
       var alignToScaleLinear = isLogScale(alignToScale) ? alignToScale.intervalStub : alignToScale;
       var targetIntervalStub = isTargetLogScale ? targetScale.intervalStub : targetScale;
       var targetLogScaleBase = targetScale.base;
@@ -65307,8 +65634,9 @@
         if ("development" !== 'production') {
           assert(this._mounted);
         }
+        var baseBrushOption = this._brushOption || DEFAULT_BRUSH_OPT;
         coverConfigList = map(coverConfigList, function (coverConfig) {
-          return merge(clone(DEFAULT_BRUSH_OPT), coverConfig, true);
+          return merge(clone(baseBrushOption), coverConfig, true);
         });
         var tmpIdPrefix = '\0-brush-index-';
         var oldCovers = this._covers;
@@ -66244,6 +66572,7 @@
         nodeGap: 8,
         draggable: true,
         layoutIterations: 32,
+        sort: 'desc',
         // true | false | 'move' | 'scale', see module:component/helper/RoamController.
         roam: false,
         roamTrigger: 'global',
@@ -66598,12 +66927,13 @@
         var iterations = filteredNodes.length !== 0 ? 0 : seriesModel.get('layoutIterations');
         var orient = seriesModel.get('orient');
         var nodeAlign = seriesModel.get('nodeAlign');
-        layoutSankey(nodes, edges, nodeWidth, nodeGap, width, height, iterations, orient, nodeAlign);
+        var sort = seriesModel.get('sort');
+        layoutSankey(nodes, edges, nodeWidth, nodeGap, width, height, iterations, orient, nodeAlign, sort);
       });
     }
-    function layoutSankey(nodes, edges, nodeWidth, nodeGap, width, height, iterations, orient, nodeAlign) {
+    function layoutSankey(nodes, edges, nodeWidth, nodeGap, width, height, iterations, orient, nodeAlign, sort) {
       computeNodeBreadths(nodes, edges, nodeWidth, width, height, orient, nodeAlign);
-      computeNodeDepths(nodes, edges, height, width, nodeGap, iterations, orient);
+      computeNodeDepths(nodes, edges, height, width, nodeGap, iterations, orient, sort);
       computeEdgeDepths(nodes, orient);
     }
     /**
@@ -66771,19 +67101,20 @@
      * @param nodeGap  the vertical distance between two nodes
      *     in the same column.
      * @param iterations  the number of iterations for the algorithm
+     * @param sort  sorting method used when resolving collisions within each column
      */
-    function computeNodeDepths(nodes, edges, height, width, nodeGap, iterations, orient) {
+    function computeNodeDepths(nodes, edges, height, width, nodeGap, iterations, orient, sort) {
       var nodesByBreadth = prepareNodesByBreadth(nodes, orient);
       initializeNodeDepth(nodesByBreadth, edges, height, width, nodeGap, orient);
-      resolveCollisions(nodesByBreadth, nodeGap, height, width, orient);
+      resolveCollisions(nodesByBreadth, nodeGap, height, width, orient, sort);
       for (var alpha = 1; iterations > 0; iterations--) {
         // 0.99 is a experience parameter, ensure that each iterations of
         // changes as small as possible.
         alpha *= 0.99;
         relaxRightToLeft(nodesByBreadth, alpha, orient);
-        resolveCollisions(nodesByBreadth, nodeGap, height, width, orient);
+        resolveCollisions(nodesByBreadth, nodeGap, height, width, orient, sort);
         relaxLeftToRight(nodesByBreadth, alpha, orient);
-        resolveCollisions(nodesByBreadth, nodeGap, height, width, orient);
+        resolveCollisions(nodesByBreadth, nodeGap, height, width, orient, sort);
       }
     }
     function prepareNodesByBreadth(nodes, orient) {
@@ -66844,12 +67175,14 @@
     /**
      * Resolve the collision of initialized depth (y-position)
      */
-    function resolveCollisions(nodesByBreadth, nodeGap, height, width, orient) {
+    function resolveCollisions(nodesByBreadth, nodeGap, height, width, orient, sort) {
       var keyAttr = orient === 'vertical' ? 'x' : 'y';
       each(nodesByBreadth, function (nodes) {
-        nodes.sort(function (a, b) {
-          return a.getLayout()[keyAttr] - b.getLayout()[keyAttr];
-        });
+        if (sort !== null) {
+          nodes.sort(function (a, b) {
+            return a.getLayout()[keyAttr] - b.getLayout()[keyAttr];
+          });
+        }
         var nodeX;
         var node;
         var dy;
@@ -89623,6 +89956,11 @@
         return is;
       };
       /**
+       * [CAVEAT]
+       *  For `visualMap.type: 'continuous'`, the input `value` can only be an `number[]`.
+       *  For `visualMap.type: 'piecewise'`, the input `value` can only be an `number | string`.
+       *  Otherwise a breaking change will be introduced to `visualMap.formatter: function() {}`.
+       *
        * @example
        * this.formatValueText(someVal); // format single numeric value to text.
        * this.formatValueText(someVal, true); // format single category value to text.
@@ -90261,13 +90599,12 @@
       return batch;
     }
 
-    var linearMap$2 = linearMap;
-    var each$b = each;
-    var mathMin$a = Math.min;
-    var mathMax$a = Math.max;
     // Arbitrary value
     var HOVER_LINK_SIZE = 12;
     var HOVER_LINK_OUT = 6;
+    /** Pixels to inflate handle label bounds when testing overlap (merge slightly before touching). */
+    var HANDLE_LABEL_MERGE_MARGIN = 2;
+    var elInner = makeInner();
     // Notice:
     // Any "interval" should be by the order of [low, high].
     // "handle0" (handleIndex === 0) maps to
@@ -90355,7 +90692,8 @@
         mainGroup.add(gradientBarGroup);
         // Bar
         gradientBarGroup.add(shapes.outOfRange = createPolygon());
-        gradientBarGroup.add(shapes.inRange = createPolygon(null, useHandle ? getCursor$1(this._orient) : null, bind(this._dragHandle, this, 'all', false), bind(this._dragHandle, this, 'all', true)));
+        gradientBarGroup.add(shapes.inRange = createPolygon(null, useHandle ? getCursor$1(this._orient) : null));
+        this._mountDrag(shapes.inRange, 'all');
         // A border radius clip.
         gradientBarGroup.setClipPath(new Rect({
           shape: {
@@ -90367,7 +90705,7 @@
           }
         }));
         var textRect = visualMapModel.textStyleModel.getTextRect('国');
-        var textSize = mathMax$a(textRect.width, textRect.height);
+        var textSize = mathMax$1(textRect.width, textRect.height);
         // Handle
         if (useHandle) {
           shapes.handleThumbs = [];
@@ -90380,20 +90718,16 @@
         targetGroup.add(mainGroup);
       };
       ContinuousView.prototype._createHandle = function (visualMapModel, mainGroup, handleIndex, itemSize, textSize, orient) {
-        var onDrift = bind(this._dragHandle, this, handleIndex, false);
-        var onDragEnd = bind(this._dragHandle, this, handleIndex, true);
         var handleSize = parsePercent(visualMapModel.get('handleSize'), itemSize[0]);
         var handleThumb = createSymbol(visualMapModel.get('handleIcon'), -handleSize / 2, -handleSize / 2, handleSize, handleSize, null, true);
         var cursor = getCursor$1(this._orient);
         handleThumb.attr({
           cursor: cursor,
-          draggable: true,
-          drift: onDrift,
-          ondragend: onDragEnd,
           onmousemove: function (e) {
             stop(e.event);
           }
         });
+        this._mountDrag(handleThumb, handleIndex);
         handleThumb.x = itemSize[0] / 2;
         handleThumb.useStyle(visualMapModel.getModel('handleStyle').getItemStyle());
         handleThumb.setStyle({
@@ -90411,19 +90745,17 @@
         var textStyleModel = this.visualMapModel.textStyleModel;
         var handleLabel = new ZRText({
           cursor: cursor,
-          draggable: true,
-          drift: onDrift,
           onmousemove: function (e) {
             // For mobile device, prevent screen slider on the button.
             stop(e.event);
           },
-          ondragend: onDragEnd,
           style: createTextStyle(textStyleModel, {
             x: 0,
             y: 0,
             text: ''
           })
         });
+        this._mountDrag(handleLabel, handleIndex);
         handleLabel.ensureState('blur').style = {
           opacity: 0.1
         };
@@ -90431,10 +90763,9 @@
           duration: 200
         };
         this.group.add(handleLabel);
-        var handleLabelPoint = [handleSize, 0];
         var shapes = this._shapes;
         shapes.handleThumbs[handleIndex] = handleThumb;
-        shapes.handleLabelPoints[handleIndex] = handleLabelPoint;
+        shapes.handleLabelPoints[handleIndex] = [handleSize, 0];
         shapes.handleLabels[handleIndex] = handleLabel;
       };
       ContinuousView.prototype._createIndicator = function (visualMapModel, mainGroup, itemSize, textSize, orient) {
@@ -90479,11 +90810,23 @@
         shapes.indicatorLabelPoint = indicatorLabelPoint;
         this._firstShowIndicator = true;
       };
-      ContinuousView.prototype._dragHandle = function (handleIndex, isEnd,
+      ContinuousView.prototype._mountDrag = function (el, handleIndex) {
+        el.attr({
+          draggable: true,
+          drift: bind(this._dragHandle, this, el, false),
+          ondragend: bind(this._dragHandle, this, el, true)
+        });
+        elInner(el).hdlIdx = handleIndex;
+      };
+      ContinuousView.prototype._dragHandle = function (sourceEl, isEnd,
       // dx is event from ondragend if isEnd is true. It's not used
       dx, dy) {
         if (!this._useHandle) {
           return;
+        }
+        var handleIndex = elInner(sourceEl).hdlIdx;
+        if ("development" !== 'production') {
+          assert(handleIndex != null);
         }
         this._dragging = !isEnd;
         if (!isEnd) {
@@ -90508,7 +90851,8 @@
         if (isEnd) {
           !this._hovering && this._clearHoverLinkToSeries();
         } else if (useHoverLinkOnHandle(this.visualMapModel)) {
-          this._doHoverLinkToSeries(this._handleEnds[handleIndex], false);
+          var hoverPos = handleIndex === 'all' ? (this._handleEnds[0] + this._handleEnds[1]) / 2 : this._handleEnds[handleIndex];
+          this._doHoverLinkToSeries(hoverPos, false);
         }
       };
       ContinuousView.prototype._resetInterval = function () {
@@ -90516,7 +90860,7 @@
         var dataInterval = this._dataInterval = visualMapModel.getSelected();
         var dataExtent = visualMapModel.getExtent();
         var sizeExtent = [0, visualMapModel.itemSize[1]];
-        this._handleEnds = [linearMap$2(dataInterval[0], dataExtent, sizeExtent, true), linearMap$2(dataInterval[1], dataExtent, sizeExtent, true)];
+        this._handleEnds = [linearMap(dataInterval[0], dataExtent, sizeExtent, true), linearMap(dataInterval[1], dataExtent, sizeExtent, true)];
       };
       /**
        * @private
@@ -90534,7 +90878,7 @@
         0);
         var dataExtent = visualMapModel.getExtent();
         // Update data interval.
-        this._dataInterval = [linearMap$2(handleEnds[0], sizeExtent, dataExtent, true), linearMap$2(handleEnds[1], sizeExtent, dataExtent, true)];
+        this._dataInterval = [linearMap(handleEnds[0], sizeExtent, dataExtent, true), linearMap(handleEnds[1], sizeExtent, dataExtent, true)];
       };
       ContinuousView.prototype._updateView = function (forSketch) {
         var visualMapModel = this.visualMapModel;
@@ -90600,19 +90944,23 @@
         return [[itemSize[0] - symbolSizes[0], handleEnds[0]], [itemSize[0], handleEnds[0]], [itemSize[0], handleEnds[1]], [itemSize[0] - symbolSizes[1], handleEnds[1]]];
       };
       ContinuousView.prototype._createBarGroup = function (itemAlign) {
-        var orient = this._orient;
+        var isVertical = this._orient === 'vertical';
+        var isItemAlignButtom = itemAlign === 'bottom';
+        var isItemAlignLeft = itemAlign === 'left';
         var inverse = this.visualMapModel.get('inverse');
-        return new Group(orient === 'horizontal' && !inverse ? {
-          scaleX: itemAlign === 'bottom' ? 1 : -1,
-          rotation: Math.PI / 2
-        } : orient === 'horizontal' && inverse ? {
-          scaleX: itemAlign === 'bottom' ? -1 : 1,
-          rotation: -Math.PI / 2
-        } : orient === 'vertical' && !inverse ? {
-          scaleX: itemAlign === 'left' ? 1 : -1,
+        return new Group(!isVertical && !inverse ? {
+          scaleX: isItemAlignButtom ? 1 : -1,
+          rotation: mathPI / 2
+        } : !isVertical && inverse ? {
+          scaleX: isItemAlignButtom ? -1 : 1,
+          rotation: -mathPI / 2
+        } : isVertical && !inverse ? {
+          scaleX: isItemAlignLeft ? 1 : -1,
           scaleY: -1
-        } : {
-          scaleX: itemAlign === 'left' ? 1 : -1
+        }
+        // isVertical && inverse
+        : {
+          scaleX: isItemAlignLeft ? 1 : -1
         });
       };
       ContinuousView.prototype._updateHandle = function (handleEnds, visualInRange) {
@@ -90625,18 +90973,22 @@
         var handleLabels = shapes.handleLabels;
         var itemSize = visualMapModel.itemSize;
         var dataExtent = visualMapModel.getExtent();
-        var align = this._applyTransform('left', shapes.mainGroup);
-        each$b([0, 1], function (handleIndex) {
+        var barGroup = shapes.mainGroup;
+        var align = this._applyTransform('left', barGroup);
+        var isVertical = this._orient === 'vertical';
+        var textPosPair = [];
+        var textRectPair = [];
+        each([0, 1], function (handleIndex) {
           var handleThumb = handleThumbs[handleIndex];
           handleThumb.setStyle('fill', visualInRange.handlesColor[handleIndex]);
           handleThumb.y = handleEnds[handleIndex];
-          var val = linearMap$2(handleEnds[handleIndex], [0, itemSize[1]], dataExtent, true);
+          var val = linearMap(handleEnds[handleIndex], [0, itemSize[1]], dataExtent, true);
           var symbolSize = this.getControllerVisual(val, 'symbolSize');
           handleThumb.scaleX = handleThumb.scaleY = symbolSize / itemSize[0];
           handleThumb.x = itemSize[0] - symbolSize / 2;
           // Update handle label position.
           var textPoint = applyTransform$1(shapes.handleLabelPoints[handleIndex], getTransform(handleThumb, this.group));
-          if (this._orient === 'horizontal') {
+          if (!isVertical) {
             // If visualMap controls symbol size, an additional offset needs to be added to labels to avoid collision at minimum size.
             // Offset reaches value of 0 at "maximum" position, so maximum position is not altered at all.
             var minimumOffset = align === 'left' || align === 'top' ? (itemSize[0] - symbolSize) / 2 : (itemSize[0] - symbolSize) / -2;
@@ -90647,9 +90999,29 @@
             y: textPoint[1],
             text: visualMapModel.formatValueText(this._dataInterval[handleIndex]),
             verticalAlign: 'middle',
-            align: this._orient === 'vertical' ? this._applyTransform('left', shapes.mainGroup) : 'center'
+            align: isVertical ? this._applyTransform('left', barGroup) : 'center'
           });
+          elInner(handleLabels[handleIndex]).hdlIdx = handleIndex; // May be updated if previously overlapped.
+          textPosPair[handleIndex] = new Point(textPoint[0], textPoint[1]);
+          textRectPair[handleIndex] = handleLabels[handleIndex].getBoundingRect().clone();
+          expandOrShrinkRect(textRectPair[handleIndex], HANDLE_LABEL_MERGE_MARGIN, false, true);
         }, this);
+        var mtv = new Point();
+        var directionVec = this._applyTransform([0, 1], barGroup);
+        var labelsOverlap = BoundingRect.intersect(textRectPair[0], textRectPair[1], mtv, {
+          direction: Math.atan2(directionVec[1], directionVec[0]),
+          bidirectional: false
+        });
+        if (labelsOverlap) {
+          textPosPair[0].scaleAndAdd(mtv, -0.5);
+          textPosPair[1].scaleAndAdd(mtv, 0.5);
+          handleLabels[0].setStyle(textPosPair[0]);
+          handleLabels[1].setStyle(textPosPair[1]);
+          // When two handles are too close, the bar is difficult to hit, so dragging in
+          // 'all' mode becomes hard to trigger. Therefore, we provide another way for
+          // that -- switch labels dragging to 'all' mode.
+          elInner(handleLabels[0]).hdlIdx = elInner(handleLabels[1]).hdlIdx = 'all';
+        }
       };
       ContinuousView.prototype._showIndicator = function (cursorValue, textValue, rangeSymbol, halfHoverLinkSize) {
         var visualMapModel = this.visualMapModel;
@@ -90667,7 +91039,7 @@
         };
         var color = this.getControllerVisual(cursorValue, 'color', opts);
         var symbolSize = this.getControllerVisual(cursorValue, 'symbolSize');
-        var y = linearMap$2(cursorValue, dataExtent, sizeExtent, true);
+        var y = linearMap(cursorValue, dataExtent, sizeExtent, true);
         var x = itemSize[0] - symbolSize / 2;
         var oldIndicatorPos = {
           x: indicator.x,
@@ -90733,7 +91105,7 @@
             var pos = self._applyTransform([e.offsetX, e.offsetY], self._shapes.mainGroup, true, true);
             // For hover link show when hover handle, which might be
             // below or upper than sizeExtent.
-            pos[1] = mathMin$a(mathMax$a(0, pos[1]), itemSize[1]);
+            pos[1] = mathMin$1(mathMax$1(0, pos[1]), itemSize[1]);
             self._doHoverLinkToSeries(pos[1], 0 <= pos[0] && pos[0] <= itemSize[0]);
           }
         }).on('mouseout', function () {
@@ -90761,11 +91133,11 @@
         var sizeExtent = [0, itemSize[1]];
         var dataExtent = visualMapModel.getExtent();
         // For hover link show when hover handle, which might be below or upper than sizeExtent.
-        cursorPos = mathMin$a(mathMax$a(sizeExtent[0], cursorPos), sizeExtent[1]);
+        cursorPos = mathMin$1(mathMax$1(sizeExtent[0], cursorPos), sizeExtent[1]);
         var halfHoverLinkSize = getHalfHoverLinkSize(visualMapModel, dataExtent, sizeExtent);
         var hoverRange = [cursorPos - halfHoverLinkSize, cursorPos + halfHoverLinkSize];
-        var cursorValue = linearMap$2(cursorPos, sizeExtent, dataExtent, true);
-        var valueRange = [linearMap$2(hoverRange[0], sizeExtent, dataExtent, true), linearMap$2(hoverRange[1], sizeExtent, dataExtent, true)];
+        var cursorValue = linearMap(cursorPos, sizeExtent, dataExtent, true);
+        var valueRange = [linearMap(hoverRange[0], sizeExtent, dataExtent, true), linearMap(hoverRange[1], sizeExtent, dataExtent, true)];
         // Consider data range is out of visualMap range, see test/visualMap-continuous.html,
         // where china and india has very large population.
         hoverRange[0] < sizeExtent[0] && (valueRange[0] = -Infinity);
@@ -90865,26 +91237,23 @@
       ContinuousView.type = 'visualMap.continuous';
       return ContinuousView;
     }(VisualMapView);
-    function createPolygon(points, cursor, onDrift, onDragEnd) {
+    function createPolygon(points, cursor) {
       return new Polygon({
         shape: {
           points: points
         },
-        draggable: !!onDrift,
         cursor: cursor,
-        drift: onDrift,
         onmousemove: function (e) {
           // For mobile device, prevent screen slider on the button.
           stop(e.event);
-        },
-        ondragend: onDragEnd
+        }
       });
     }
     function getHalfHoverLinkSize(visualMapModel, dataExtent, sizeExtent) {
       var halfHoverLinkSize = HOVER_LINK_SIZE / 2;
       var hoverLinkDataSize = visualMapModel.get('hoverLinkDataSize');
       if (hoverLinkDataSize) {
-        halfHoverLinkSize = linearMap$2(hoverLinkDataSize, dataExtent, sizeExtent, true) / 2;
+        halfHoverLinkSize = linearMap(hoverLinkDataSize, dataExtent, sizeExtent, true) / 2;
       }
       return halfHoverLinkSize;
     }
@@ -91014,13 +91383,13 @@
       }
     }
 
-    var each$c = each;
+    var each$b = each;
     function visualMapPreprocessor(option) {
       var visualMap = option && option.visualMap;
       if (!isArray(visualMap)) {
         visualMap = visualMap ? [visualMap] : [];
       }
-      each$c(visualMap, function (opt) {
+      each$b(visualMap, function (opt) {
         if (!opt) {
           return;
         }
@@ -91031,7 +91400,7 @@
         }
         var pieces = opt.pieces;
         if (pieces && isArray(pieces)) {
-          each$c(pieces, function (piece) {
+          each$b(pieces, function (piece) {
             if (isObject(piece)) {
               if (has$1(piece, 'start') && !has$1(piece, 'min')) {
                 piece.min = piece.start;
@@ -91046,7 +91415,7 @@
         if ("development" !== 'production') {
           var seriesTargets = opt.seriesTargets;
           if (seriesTargets && isArray(seriesTargets)) {
-            each$c(seriesTargets, function (target) {
+            each$b(seriesTargets, function (target) {
               if (!isObject(target) || target.dimension == null) {
                 console.warn('Each seriesTarget should have a dimension property');
               }
